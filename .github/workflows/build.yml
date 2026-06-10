@@ -27,7 +27,6 @@ jobs:
         run: |
           sdkmanager "ndk;25.2.9519653" "build-tools;34.0.0" "platforms;android-34" --sdk_root=$ANDROID_SDK_ROOT
           echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
 
       - name: Install CMake
         run: |
@@ -51,8 +50,10 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -G Ninja
           ninja -j$(nproc)
+          echo "=== Fichiers produits ==="
+          find /tmp/whisper-build-arm64 -name "*.so"
           mkdir -p $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a
-          cp libwhisper.so $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/
+          find /tmp/whisper-build-arm64 -name "libwhisper.so" -exec cp {} $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/ \;
 
       - name: Build whisper.cpp x86_64
         run: |
@@ -69,7 +70,7 @@ jobs:
             -G Ninja
           ninja -j$(nproc)
           mkdir -p $GITHUB_WORKSPACE/app/src/main/jniLibs/x86_64
-          cp libwhisper.so $GITHUB_WORKSPACE/app/src/main/jniLibs/x86_64/
+          find /tmp/whisper-build-x86_64 -name "libwhisper.so" -exec cp {} $GITHUB_WORKSPACE/app/src/main/jniLibs/x86_64/ \;
 
       - name: Build JNI bridge
         run: |
@@ -125,22 +126,22 @@ jobs:
           Java_com_benmaty_whispertranscriber_WhisperJNI_cancelTranscription(JNIEnv *, jobject, jlong) {}
           }
           CPPEOF
-          # arm64
           mkdir -p $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a
           $NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++ \
             -std=c++17 -O2 -fPIC -shared \
-            -I/tmp/whisper.cpp \
+            -I/tmp/whisper.cpp/include \
+            -I/tmp/whisper.cpp/ggml/include \
             /tmp/whisper_jni.cpp \
-            -L/tmp/whisper-build-arm64 \
+            -L$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a \
             -lwhisper -landroid -llog \
             -o $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libwhisper_android.so
-          # x86_64
           mkdir -p $GITHUB_WORKSPACE/app/src/main/jniLibs/x86_64
           $NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android26-clang++ \
             -std=c++17 -O2 -fPIC -shared \
-            -I/tmp/whisper.cpp \
+            -I/tmp/whisper.cpp/include \
+            -I/tmp/whisper.cpp/ggml/include \
             /tmp/whisper_jni.cpp \
-            -L/tmp/whisper-build-x86_64 \
+            -L$GITHUB_WORKSPACE/app/src/main/jniLibs/x86_64 \
             -lwhisper -landroid -llog \
             -o $GITHUB_WORKSPACE/app/src/main/jniLibs/x86_64/libwhisper_android.so
 
