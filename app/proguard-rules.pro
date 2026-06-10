@@ -1,0 +1,3 @@
+-keep class com.benmaty.whispertranscriber.WhisperJNI { *; }
+-keep class com.benmaty.whispertranscriber.model.** { *; }
+-keepclassmembers class * { native <methods>; }
