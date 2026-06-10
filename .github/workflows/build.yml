@@ -1,0 +1,176 @@
+name: Build Whisper APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK and Build Tools
+        run: |
+          sdkmanager "ndk;25.2.9519653" "build-tools;34.0.0" "platforms;android-34" --sdk_root=$ANDROID_SDK_ROOT
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
+
+      - name: Install CMake
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Clone whisper.cpp
+        run: git clone --depth=1 https://github.com/ggerganov/whisper.cpp.git /tmp/whisper.cpp
+
+      - name: Build whisper.cpp arm64-v8a
+        run: |
+          mkdir -p /tmp/whisper-build-arm64
+          cd /tmp/whisper-build-arm64
+          cmake /tmp/whisper.cpp \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -G Ninja
+          ninja -j$(nproc)
+          mkdir -p $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a
+          cp libwhisper.so $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/
+
+      - name: Build whisper.cpp x86_64
+        run: |
+          mkdir -p /tmp/whisper-build-x86_64
+          cd /tmp/whisper-build-x86_64
+          cmake /tmp/whisper.cpp \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=x86_64 \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -G Ninja
+          ninja -j$(nproc)
+          mkdir -p $GITHUB_WORKSPACE/app/src/main/jniLibs/x86_64
+          cp libwhisper.so $GITHUB_WORKSPACE/app/src/main/jniLibs/x86_64/
+
+      - name: Build JNI bridge
+        run: |
+          cat > /tmp/whisper_jni.cpp << 'CPPEOF'
+          #include <jni.h>
+          #include <string>
+          #include "whisper.h"
+          extern "C" {
+          JNIEXPORT jlong JNICALL
+          Java_com_benmaty_whispertranscriber_WhisperJNI_initContext(JNIEnv *env, jobject, jstring modelPath) {
+              const char *path = env->GetStringUTFChars(modelPath, nullptr);
+              whisper_context_params cparams = whisper_context_default_params();
+              cparams.use_gpu = false;
+              whisper_context *ctx = whisper_init_from_file_with_params(path, cparams);
+              env->ReleaseStringUTFChars(modelPath, path);
+              return (jlong)(intptr_t)ctx;
+          }
+          JNIEXPORT jstring JNICALL
+          Java_com_benmaty_whispertranscriber_WhisperJNI_transcribeAudio(
+                  JNIEnv *env, jobject, jlong ctxPtr, jfloatArray samples, jint language, jboolean translate) {
+              whisper_context *ctx = (whisper_context *)(intptr_t)ctxPtr;
+              if (!ctx) return env->NewStringUTF("");
+              jsize len = env->GetArrayLength(samples);
+              jfloat *pcm = env->GetFloatArrayElements(samples, nullptr);
+              whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+              params.print_realtime = false;
+              params.print_progress = false;
+              params.print_timestamps = false;
+              params.translate = (bool)translate;
+              params.n_threads = 4;
+              params.language = (language < 0) ? nullptr : whisper_lang_str(language);
+              params.detect_language = (language < 0);
+              params.no_context = true;
+              int ret = whisper_full(ctx, params, pcm, (int)len);
+              env->ReleaseFloatArrayElements(samples, pcm, JNI_ABORT);
+              if (ret != 0) return env->NewStringUTF("");
+              std::string result;
+              int n = whisper_full_n_segments(ctx);
+              for (int i = 0; i < n; i++) {
+                  const char *text = whisper_full_get_segment_text(ctx, i);
+                  if (text) result += text;
+              }
+              return env->NewStringUTF(result.c_str());
+          }
+          JNIEXPORT void JNICALL
+          Java_com_benmaty_whispertranscriber_WhisperJNI_freeContext(JNIEnv *, jobject, jlong ctxPtr) {
+              whisper_context *ctx = (whisper_context *)(intptr_t)ctxPtr;
+              if (ctx) whisper_free(ctx);
+          }
+          JNIEXPORT jint JNICALL
+          Java_com_benmaty_whispertranscriber_WhisperJNI_getProgress(JNIEnv *, jobject, jlong) { return 0; }
+          JNIEXPORT void JNICALL
+          Java_com_benmaty_whispertranscriber_WhisperJNI_cancelTranscription(JNIEnv *, jobject, jlong) {}
+          }
+          CPPEOF
+          # arm64
+          mkdir -p $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a
+          $NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++ \
+            -std=c++17 -O2 -fPIC -shared \
+            -I/tmp/whisper.cpp \
+            /tmp/whisper_jni.cpp \
+            -L/tmp/whisper-build-arm64 \
+            -lwhisper -landroid -llog \
+            -o $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libwhisper_android.so
+          # x86_64
+          mkdir -p $GITHUB_WORKSPACE/app/src/main/jniLibs/x86_64
+          $NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android26-clang++ \
+            -std=c++17 -O2 -fPIC -shared \
+            -I/tmp/whisper.cpp \
+            /tmp/whisper_jni.cpp \
+            -L/tmp/whisper-build-x86_64 \
+            -lwhisper -landroid -llog \
+            -o $GITHUB_WORKSPACE/app/src/main/jniLibs/x86_64/libwhisper_android.so
+
+      - name: Generate keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore $GITHUB_WORKSPACE/app/keystore.jks \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias whisper_key \
+            -dname "CN=Benmaty,O=Whisper,C=FR" \
+            -storepass whisper123 -keypass whisper123
+          echo "KEYSTORE_PATH=$GITHUB_WORKSPACE/app/keystore.jks" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=whisper123" >> $GITHUB_ENV
+          echo "KEY_ALIAS=whisper_key" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=whisper123" >> $GITHUB_ENV
+
+      - name: Install Gradle 8.2
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.2-bin.zip -O /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /opt/gradle
+          echo "/opt/gradle/gradle-8.2/bin" >> $GITHUB_PATH
+
+      - name: Build Release APK
+        run: |
+          cd $GITHUB_WORKSPACE
+          gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WhisperTranscriber-APK
+          path: app/build/outputs/apk/release/app-release.apk
+          retention-days: 30
